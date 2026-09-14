@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
+#
+# Controller: csi-provisioner sidecar + daos-csi --mode controller. It only
+# talks to the Kubernetes API (DaosContainer CRs), so it needs no DAOS access.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: daos-csi-controller
+  labels: {app.kubernetes.io/name: daos-csi, app.kubernetes.io/component: controller}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: daos-csi, app.kubernetes.io/component: controller}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: daos-csi, app.kubernetes.io/component: controller}
+    spec:
+      serviceAccountName: daos-csi-controller
+      containers:
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election
+            - --leader-election-namespace=$(NAMESPACE)
+            - --extra-create-metadata          # passes PVC name/namespace as parameters (csi.storage.k8s.io/*)
+            - --timeout=60s
+            - --retry-interval-start=2s
+            - --v=2
+          env:
+            - name: NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          volumeMounts:
+            - {name: socket, mountPath: /csi}
+        - name: daos-csi
+          image: registry.gitlab.gluesys.com/exastor/daos-csi/daos-csi:0.1.0
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+            - --namespace=$(NAMESPACE)          # where DaosContainer CRs are created
+            - --v=2
+          env:
+            - name: NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          volumeMounts:
+            - {name: socket, mountPath: /csi}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+      volumes:
+        - name: socket
+          emptyDir: {}

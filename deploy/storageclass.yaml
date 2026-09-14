@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
+#
+# Example StorageClass: one per DaosPool. Not part of the kustomization on
+# purpose -- the pool name is yours.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: daos-kv
+provisioner: daos.csi.gluesys.com
+reclaimPolicy: Delete            # Delete = destroy the DAOS container (destroyOnDelete=true)
+volumeBindingMode: Immediate
+allowVolumeExpansion: false      # DAOS 2.8: capacity is a pool property
+parameters:
+  pool: kv                       # DaosPool name (required)
+  oclass: RP_2GX                 # file object class (lmcache-daos measured default)
+  dirOclass: RP_2G1
+  chunkSize: "4194304"
+  csum: crc32
+  # rdFac: "1"
+  # namespace: daos-system       # where DaosContainer CRs go (default: controller --namespace)
+  # destroyOnDelete: "false"     # keep the DAOS container when the PV is deleted

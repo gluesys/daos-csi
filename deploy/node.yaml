@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
+#
+# Node plugin: registrar + daos-csi --mode node + daos_agent native sidecar.
+# dfuse runs inside the daos-csi container (ADR-csi-001); its mounts must
+# propagate to the host (Bidirectional) so kubelet can bind them into pods.
+# The agent reads the operator's <system>-agent ConfigMap; with TLS also mount
+# the <system>-certs Secret (agent set) at /etc/daos/certs in both containers.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: daos-csi-node
+  labels: {app.kubernetes.io/name: daos-csi, app.kubernetes.io/component: node}
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: daos-csi, app.kubernetes.io/component: node}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}   # a restart interrupts that node's DAOS PV I/O (FUSE)
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: daos-csi, app.kubernetes.io/component: node}
+    spec:
+      serviceAccountName: daos-csi-node
+      hostNetwork: true                  # fabric (ofi+verbs) address for the client library
+      dnsPolicy: ClusterFirstWithHostNet
+      shareProcessNamespace: true        # agent validates client processes
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: agent
+          image: registry.gitlab.gluesys.com/exastor/daos-images/daos-agent:2.8.0-20260914
+          restartPolicy: Always          # native sidecar
+          volumeMounts:
+            - {name: agentcfg, mountPath: /etc/daos/daos_agent.yml, subPath: daos_agent.yml, readOnly: true}
+            - {name: agentsock, mountPath: /var/run/daos_agent}
+      containers:
+        - name: registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/daos.csi.gluesys.com/csi.sock
+            - --v=2
+          volumeMounts:
+            - {name: socket, mountPath: /csi}
+            - {name: registration, mountPath: /registration}
+        - name: daos-csi
+          image: registry.gitlab.gluesys.com/exastor/daos-csi/daos-csi:0.1.0
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+            - --node-id=$(NODE_ID)
+            - --staging-dir=/var/lib/daos-csi
+            - --v=2
+          env:
+            - name: NODE_ID
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: DAOS_AGENT_DRPC_DIR
+              value: /var/run/daos_agent
+          securityContext:
+            privileged: true             # FUSE (/dev/fuse), RDMA (/dev/infiniband), mount propagation
+          volumeMounts:
+            - {name: socket, mountPath: /csi}
+            - {name: agentsock, mountPath: /var/run/daos_agent}
+            - {name: kubelet, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional}
+            - {name: staging, mountPath: /var/lib/daos-csi, mountPropagation: Bidirectional}
+            - {name: dev, mountPath: /dev}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+      volumes:
+        - name: socket
+          hostPath: {path: /var/lib/kubelet/plugins/daos.csi.gluesys.com, type: DirectoryOrCreate}
+        - name: registration
+          hostPath: {path: /var/lib/kubelet/plugins_registry, type: Directory}
+        - name: kubelet
+          hostPath: {path: /var/lib/kubelet, type: Directory}
+        - name: staging
+          hostPath: {path: /var/lib/daos-csi, type: DirectoryOrCreate}
+        - name: dev
+          hostPath: {path: /dev, type: Directory}
+        - name: agentsock
+          emptyDir: {}
+        - name: agentcfg
+          configMap:
+            name: daos-agent                # <DaosSystem name>-agent, rendered by the operator

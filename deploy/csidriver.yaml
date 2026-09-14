@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: daos.csi.gluesys.com
+spec:
+  attachRequired: false          # no ControllerPublish: dfuse mounts straight from the node
+  podInfoOnMount: false
+  fsGroupPolicy: None            # ownership is DAOS ACL, not chown
+  volumeLifecycleModes: [Persistent]
+  requiresRepublish: false

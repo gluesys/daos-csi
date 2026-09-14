@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
+#
+# One CSI deployment per DaosSystem: the node DaemonSet carries a daos_agent
+# sidecar configured from that system's ConfigMap. Edit the system name in
+# node.yaml / controller.yaml (default "daos") and the namespace below.
+namespace: daos-system
+resources:
+  - csidriver.yaml
+  - rbac.yaml
+  - controller.yaml
+  - node.yaml
+images:
+  - name: registry.gitlab.gluesys.com/exastor/daos-csi/daos-csi
+    newTag: 0.1.0
