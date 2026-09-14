@@ -13,8 +13,8 @@ volumeBindingMode: Immediate
 allowVolumeExpansion: false      # DAOS 2.8: capacity is a pool property
 parameters:
   pool: kv                       # DaosPool name (required)
-  oclass: RP_2GX                 # file object class (lmcache-daos measured default)
-  dirOclass: RP_2G1
+  oclass: RP_2GX                 # file object class (lmcache-daos measured default); needs >= 2 server nodes
+  dirOclass: RP_2G1              # single-node systems: oclass SX, dirOclass S1, rdFac "0" (RP_2 fails: "grp size (2) is larger than domain nr (1)")
   chunkSize: "4194304"
   csum: crc32
   # rdFac: "1"

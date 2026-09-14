@@ -34,6 +34,11 @@ kubectl apply -k deploy/   # CSIDriver, controller Deployment(csi-provisioner), 
 StorageClass 예시(`deploy/storageclass.yaml`): `provisioner: daos.csi.gluesys.com`, `parameters: {pool: kv, oclass: RP_2GX, chunkSize: "4194304", csum: crc32}`,
 `reclaimPolicy: Delete`. PVC 는 RWX/RWO 모두 같은 dfuse 마운트다.
 
+## 실장비 검증 (2026-09-15, daos_ci)
+`daos-csi:0.1.0` 노드 모드를 podman 으로 띄우고(호스트 `daos_agent` 소켓 마운트) `csi-check --pool optest --container optest-c`:
+NodeStageVolume 1.06s(dfuse over ofi+verbs) → Publish → 쓰기·읽기 → Unpublish → Unstage ALL PASS, 컨테이너 재시작 후 상태 파일로 재마운트 확인.
+자세한 기록은 daos-operator `doc/testbed-2026-09-15.md`. 주의: 기본 oclass RP_2GX/RP_2G1 은 서버 노드 2대 이상에서만 생성된다.
+
 ## 알려진 제한 (Phase 2)
 - 노드 플러그인 재시작·업그레이드 중 그 노드의 DAOS PV I/O 가 끊긴다(FUSE). 상태 파일로 자동 재마운트한다.
 - 용량은 컨테이너가 아니라 풀에서 강제된다(DAOS 2.8). `CreateVolume` 은 풀 free 보다 큰 요청만 거부한다.
