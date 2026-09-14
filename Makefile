@@ -9,8 +9,9 @@ export GOTOOLCHAIN ?= auto
 export GOFLAGS ?= -buildvcs=false
 
 .PHONY: build test fmt vet image push
-build: ## Build bin/daos-csi
+build: ## Build bin/daos-csi and bin/csi-check
 	CGO_ENABLED=0 go build -o bin/daos-csi ./cmd/daos-csi
+	CGO_ENABLED=0 go build -o bin/csi-check ./cmd/csi-check
 test: fmt vet ## Unit tests + csi-sanity
 	go test ./... -coverprofile cover.out
 fmt:
