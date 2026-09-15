@@ -21,6 +21,7 @@ syntax:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
 
 license-headers:
   stage: check
@@ -37,6 +38,7 @@ license-headers:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
 
 go-build:
   stage: check
@@ -52,12 +54,15 @@ go-build:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
 
 # driver image on the exa-build runner (shell + podman); same registry quirks as daos-operator
 image-csi:
   stage: image
   tags: [daos-build]
-  needs: [go-build]
+  needs:
+    - job: go-build
+      optional: true
   before_script:
     - export REG="${CI_REGISTRY%%:*}"
     - export IMG="$REG/$CI_PROJECT_PATH/daos-csi"
