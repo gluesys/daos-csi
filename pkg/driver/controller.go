@@ -30,6 +30,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/klog/v2"
 )
 
@@ -59,7 +60,10 @@ const (
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,127}$`)
 
 func (d *Driver) ControllerGetCapabilities(context.Context, *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
-	caps := []csi.ControllerServiceCapability_RPC_Type{csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME}
+	caps := []csi.ControllerServiceCapability_RPC_Type{
+		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+	}
 	out := make([]*csi.ControllerServiceCapability, 0, len(caps))
 	for _, c := range caps {
 		out = append(out, &csi.ControllerServiceCapability{Type: &csi.ControllerServiceCapability_Rpc{Rpc: &csi.ControllerServiceCapability_RPC{Type: c}}})
@@ -257,6 +261,29 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 	}
 	return &csi.ValidateVolumeCapabilitiesResponse{Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
 		VolumeContext: req.GetVolumeContext(), VolumeCapabilities: req.GetVolumeCapabilities(), Parameters: req.GetParameters()}}, nil
+}
+
+// GetCapacity reports what the pool behind a StorageClass has left. DAOS
+// enforces capacity per pool, not per container, so every volume from the same
+// StorageClass shares this number; the external-provisioner turns it into
+// CSIStorageCapacity objects when it runs with --enable-capacity.
+func (d *Driver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
+	name := req.GetParameters()[ParamPool]
+	if name == "" {
+		// no pool named: nothing useful to say, and guessing would be worse
+		return &csi.GetCapacityResponse{AvailableCapacity: 0}, nil
+	}
+	pool, err := d.cfg.Containers.GetPool(ctx, name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get DaosPool %s: %v", name, err)
+	}
+	if !pool.Exists || pool.UUID == "" {
+		return &csi.GetCapacityResponse{AvailableCapacity: 0}, nil
+	}
+	return &csi.GetCapacityResponse{
+		AvailableCapacity: pool.FreeBytes,
+		MaximumVolumeSize: wrapperspb.Int64(pool.FreeBytes),
+	}, nil
 }
 
 func (d *Driver) ControllerPublishVolume(context.Context, *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {

@@ -197,6 +197,75 @@ func TestNodeStagePublishAndRecovery(t *testing.T) {
 	}
 }
 
+func TestNodeGetVolumeStats(t *testing.T) {
+	ctx := context.Background()
+	fuse, mounts := newFakeFuse(), newFakeMounts()
+	d := newTestDriver(t, newFakeCRs(), fuse, mounts)
+	staging, target := filepath.Join(t.TempDir(), "staging"), t.TempDir()
+	vc := map[string]string{ctxPool: "kv", ctxContainer: "pvc-1"}
+	if _, err := d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{VolumeId: "pvc-1", StagingTargetPath: staging, VolumeCapability: rwx(), VolumeContext: vc}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := d.NodeGetVolumeStats(ctx, &csi.NodeGetVolumeStatsRequest{VolumeId: "pvc-1", VolumePath: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Usage) == 0 || resp.Usage[0].Unit != csi.VolumeUsage_BYTES || resp.Usage[0].Total <= 0 {
+		t.Fatalf("usage: %+v", resp.Usage)
+	}
+	if resp.Usage[0].Used+resp.Usage[0].Available > resp.Usage[0].Total+resp.Usage[0].Total/100 {
+		t.Errorf("used+available must be within total: %+v", resp.Usage[0])
+	}
+	// the driver advertises the capability it implements
+	caps, _ := d.NodeGetCapabilities(ctx, &csi.NodeGetCapabilitiesRequest{})
+	var hasStats bool
+	for _, c := range caps.Capabilities {
+		if c.GetRpc().GetType() == csi.NodeServiceCapability_RPC_GET_VOLUME_STATS {
+			hasStats = true
+		}
+	}
+	if !hasStats {
+		t.Error("GET_VOLUME_STATS must be advertised")
+	}
+	for _, bad := range []*csi.NodeGetVolumeStatsRequest{
+		{VolumePath: target}, {VolumeId: "pvc-1"},
+	} {
+		if _, err := d.NodeGetVolumeStats(ctx, bad); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("bad request %+v: %v", bad, err)
+		}
+	}
+	if _, err := d.NodeGetVolumeStats(ctx, &csi.NodeGetVolumeStatsRequest{VolumeId: "pvc-1", VolumePath: filepath.Join(target, "nope")}); status.Code(err) != codes.NotFound {
+		t.Errorf("missing path must be NotFound: %v", err)
+	}
+}
+
+func TestGetCapacityFollowsThePool(t *testing.T) {
+	ctx := context.Background()
+	crs := newFakeCRs()
+	d := newTestDriver(t, crs, newFakeFuse(), newFakeMounts())
+	resp, err := d.GetCapacity(ctx, &csi.GetCapacityRequest{Parameters: map[string]string{ParamPool: "kv"}})
+	if err != nil || resp.AvailableCapacity != 100<<30 || resp.MaximumVolumeSize.GetValue() != 100<<30 {
+		t.Fatalf("%+v %v", resp, err)
+	}
+	// unknown pool or no parameter: zero, not a guess
+	for _, p := range []map[string]string{{ParamPool: "nope"}, {}} {
+		resp, err = d.GetCapacity(ctx, &csi.GetCapacityRequest{Parameters: p})
+		if err != nil || resp.AvailableCapacity != 0 {
+			t.Fatalf("%v: %+v %v", p, resp, err)
+		}
+	}
+	caps, _ := d.ControllerGetCapabilities(ctx, &csi.ControllerGetCapabilitiesRequest{})
+	var hasCap bool
+	for _, c := range caps.Capabilities {
+		if c.GetRpc().GetType() == csi.ControllerServiceCapability_RPC_GET_CAPACITY {
+			hasCap = true
+		}
+	}
+	if !hasCap {
+		t.Error("GET_CAPACITY must be advertised")
+	}
+}
+
 // TestSanity runs kubernetes-csi/csi-test against the whole driver with fakes.
 func TestSanity(t *testing.T) {
 	dir := t.TempDir()

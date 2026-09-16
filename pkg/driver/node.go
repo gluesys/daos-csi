@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -103,9 +104,49 @@ func (d *Driver) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.Nod
 }
 
 func (d *Driver) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	return &csi.NodeGetCapabilitiesResponse{Capabilities: []*csi.NodeServiceCapability{
-		{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME}}},
-	}}, nil
+	// VOLUME_CONDITION is alpha and not in the released CSI spec package, so a
+	// broken mount is reported as an error from NodeGetVolumeStats instead.
+	rpc := []csi.NodeServiceCapability_RPC_Type{
+		csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+		csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
+	}
+	caps := make([]*csi.NodeServiceCapability, 0, len(rpc))
+	for _, t := range rpc {
+		caps = append(caps, &csi.NodeServiceCapability{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: t}}})
+	}
+	return &csi.NodeGetCapabilitiesResponse{Capabilities: caps}, nil
+}
+
+// NodeGetVolumeStats answers what kubelet shows as PVC usage. DAOS has no
+// per-container quota, so statfs on the dfuse mount reports the pool's numbers:
+// that is what the application actually has left, which is the useful answer.
+// A dead dfuse answers ENOTCONN here, and saying so is the point.
+func (d *Driver) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	path := req.GetVolumePath()
+	if path == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume path is required")
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.NotFound, "volume path %s does not exist on node %s", path, d.cfg.NodeID)
+		}
+		return nil, status.Errorf(codes.Internal, "cannot stat %s: %v (is dfuse still running?)", path, err)
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return nil, status.Errorf(codes.Internal, "statfs %s: %v (is dfuse still running?)", path, err)
+	}
+	bs := int64(st.Bsize)
+	total, free, avail := int64(st.Blocks)*bs, int64(st.Bfree)*bs, int64(st.Bavail)*bs
+	usage := []*csi.VolumeUsage{{Unit: csi.VolumeUsage_BYTES, Total: total, Available: avail, Used: total - free}}
+	if st.Files > 0 {
+		usage = append(usage, &csi.VolumeUsage{Unit: csi.VolumeUsage_INODES, Total: int64(st.Files),
+			Available: int64(st.Ffree), Used: int64(st.Files) - int64(st.Ffree)})
+	}
+	return &csi.NodeGetVolumeStatsResponse{Usage: usage}, nil
 }
 
 // NodeStageVolume starts dfuse on the driver's own staging path for the volume.

@@ -39,6 +39,15 @@ StorageClass 예시(`deploy/storageclass.yaml`): `provisioner: daos.csi.gluesys.
 NodeStageVolume 1.06s(dfuse over ofi+verbs) → Publish → 쓰기·읽기 → Unpublish → Unstage ALL PASS, 컨테이너 재시작 후 상태 파일로 재마운트 확인.
 자세한 기록은 daos-operator `doc/testbed-2026-09-15.md`. 주의: 기본 oclass RP_2GX/RP_2G1 은 서버 노드 2대 이상에서만 생성된다.
 
+## 용량 관측 (#5)
+- **`NodeGetVolumeStats`**(GET_VOLUME_STATS): dfuse 마운트에 `statfs` 를 해서 바이트와 아이노드를 보고한다. kubelet 이 이 값을
+  `kubelet_volume_stats_*` 메트릭으로 내보내므로 PVC 사용량이 대시보드에 나온다. DAOS 는 컨테이너 쿼터가 없어 **풀 수치가 곧 앱이 쓸 수 있는 값**이다.
+  dfuse 가 죽은 마운트는 여기서 ENOTCONN 으로 드러나며 오류로 보고한다(VOLUME_CONDITION 은 CSI 릴리스 스펙에 없는 알파라 쓰지 않는다).
+- **`GetCapacity`**(GET_CAPACITY): StorageClass 의 `pool` 파라미터로 `DaosPool.status.freeBytes` 를 보고한다.
+  external-provisioner 를 `--enable-capacity` 로 돌리면 CSIStorageCapacity 객체가 만들어져 스케줄러가 참고한다. 풀 이름이 없거나
+  아직 uuid 가 없으면 0 을 보고한다(추측하지 않는다).
+- csi-sanity 38건 통과(기능을 광고하면 sanity 가 해당 검사를 추가로 돈다).
+
 ## 알려진 제한 (Phase 2)
 - 노드 플러그인 재시작·업그레이드 중 그 노드의 DAOS PV I/O 가 끊긴다(FUSE). 상태 파일로 자동 재마운트한다.
 - 용량은 컨테이너가 아니라 풀에서 강제된다(DAOS 2.8). `CreateVolume` 은 풀 free 보다 큰 요청만 거부한다.
