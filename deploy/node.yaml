@@ -32,9 +32,13 @@ spec:
         - name: agent
           image: registry.gitlab.gluesys.com/exastor/daos-images/daos-agent:2.8.0-20260914
           restartPolicy: Always          # native sidecar
+          # the agent enumerates the fabric itself to answer GetAttachInfo, so it
+          # needs the RDMA devices; without /dev clients fail with DER_MISC
+          securityContext: {privileged: true}
           volumeMounts:
             - {name: agentcfg, mountPath: /etc/daos/daos_agent.yml, subPath: daos_agent.yml, readOnly: true}
             - {name: agentsock, mountPath: /var/run/daos_agent}
+            - {name: dev, mountPath: /dev}
       containers:
         - name: registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
