@@ -120,11 +120,22 @@ func (r *DfuseRunner) Start(ctx context.Context, pool, container, mountpoint str
 }
 
 func (r *DfuseRunner) Stop(_ context.Context, mountpoint string) error {
+	// the path can be gone already (a previous unstage, or somebody cleaned up by
+	// hand); then there is nothing to unmount and reporting failure would make
+	// kubelet retry forever
+	if _, err := os.Stat(mountpoint); os.IsNotExist(err) {
+		r.mu.Lock()
+		delete(r.procs, mountpoint)
+		r.mu.Unlock()
+		return nil
+	}
 	out, err := exec.Command(r.Umount, "-u", mountpoint).CombinedOutput()
 	if err != nil {
-		if notMnt, e := r.Mounter.IsLikelyNotMountPoint(mountpoint); e == nil && notMnt {
-			err = nil // already gone
-		} else {
+		notMnt, e := r.Mounter.IsLikelyNotMountPoint(mountpoint)
+		switch {
+		case e == nil && notMnt, os.IsNotExist(e):
+			// already unmounted, or the directory went away under us
+		default:
 			return fmt.Errorf("%s -u %s: %v: %s", r.Umount, mountpoint, err, strings.TrimSpace(string(out)))
 		}
 	}

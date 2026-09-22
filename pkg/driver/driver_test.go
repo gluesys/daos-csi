@@ -197,6 +197,21 @@ func TestNodeStagePublishAndRecovery(t *testing.T) {
 	}
 }
 
+func TestUnstageIsIdempotentWhenTheMountIsGone(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDriver(t, newFakeCRs(), newFakeFuse(), newFakeMounts())
+	staging := filepath.Join(t.TempDir(), "staging")
+	// never staged on this node: unstage must succeed, not fail forever
+	if _, err := d.NodeUnstageVolume(ctx, &csi.NodeUnstageVolumeRequest{VolumeId: "pvc-gone", StagingTargetPath: staging}); err != nil {
+		t.Fatalf("unstage of an unknown volume must be a no-op: %v", err)
+	}
+	// and the real runner treats a missing mount point the same way
+	r := NewDfuseRunner(newFakeMounts())
+	if err := r.Stop(ctx, filepath.Join(t.TempDir(), "not-there")); err != nil {
+		t.Fatalf("Stop on a missing path: %v", err)
+	}
+}
+
 func TestNodeGetVolumeStats(t *testing.T) {
 	ctx := context.Background()
 	fuse, mounts := newFakeFuse(), newFakeMounts()
