@@ -19,6 +19,7 @@ package driver
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -302,3 +303,40 @@ func TestSanity(t *testing.T) {
 	cfg.IdempotentCount = 2
 	sanity.Test(t, cfg)
 }
+
+// A bind mount that stays on the same filesystem is invisible to
+// IsLikelyNotMountPoint (it compares st_dev with the parent), so unbind used to
+// skip the unmount and then fail to remove the directory with EBUSY, wedging
+// NodeUnpublish forever (exaci4-2, 2026-09-22).
+func TestUnbindUnmountsABindTheDeviceCheckCannotSee(t *testing.T) {
+	mounts := newFakeMounts()
+	d, err := New(Config{Endpoint: "unix://" + filepath.Join(t.TempDir(), "csi.sock"), NodeID: "node-a",
+		Containers: newFakeCRs(), Namespace: "daos-csi", Mounter: sameDeviceMounts{mounts},
+		Fuse: newFakeFuse(), StagingDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "target")
+	if err := d.bind(filepath.Join(t.TempDir(), "src"), dst, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.unbind(dst); err != nil {
+		t.Fatalf("unbind: %v", err)
+	}
+	if len(mounts.mounts) != 0 {
+		t.Fatalf("bind must be unmounted: %v", mounts.mounts)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("unbind must remove the directory: %v", err)
+	}
+	// and it stays idempotent once everything is gone
+	if err := d.unbind(dst); err != nil {
+		t.Fatalf("second unbind: %v", err)
+	}
+}
+
+// sameDeviceMounts mounts and unmounts for real (in the map) but always claims
+// the path is not a mountpoint, like a bind within one filesystem.
+type sameDeviceMounts struct{ *fakeMounts }
+
+func (sameDeviceMounts) IsLikelyNotMountPoint(string) (bool, error) { return true, nil }

@@ -132,6 +132,9 @@ func (f *fakeFuse) Start(_ context.Context, pool, container, mountpoint string) 
 	if f.fail {
 		return fmt.Errorf("dfuse: DER_NONEXIST")
 	}
+	if _, ok := f.running[mountpoint]; ok {
+		return nil // Start is idempotent: a live mount is left alone
+	}
 	f.starts++
 	f.running[mountpoint] = [2]string{pool, container}
 	return nil

@@ -56,6 +56,7 @@ type DfuseRunner struct {
 	Umount  string   // fusermount3
 	Args    []string // extra dfuse flags (e.g. --disable-caching)
 	Mounter Mounter
+	Timeout time.Duration // how long to wait for the mount; 0 means 30s
 
 	mu    sync.Mutex
 	procs map[string]*exec.Cmd
@@ -66,12 +67,17 @@ func NewDfuseRunner(m Mounter, extra ...string) *DfuseRunner {
 }
 
 func (r *DfuseRunner) Start(ctx context.Context, pool, container, mountpoint string) error {
+	// A tracked process is not proof of a mount: a previous Start may have timed
+	// out and killed dfuse, and its entry lives until the reaper goroutine runs.
+	// Only a process *and* a live mount means there is nothing to do.
 	r.mu.Lock()
-	if _, ok := r.procs[mountpoint]; ok {
-		r.mu.Unlock()
-		return nil
-	}
+	_, tracked := r.procs[mountpoint]
 	r.mu.Unlock()
+	if tracked {
+		if notMnt, err := r.Mounter.IsLikelyNotMountPoint(mountpoint); err == nil && !notMnt {
+			return nil
+		}
+	}
 	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
 		return err
 	}
@@ -98,7 +104,11 @@ func (r *DfuseRunner) Start(ctx context.Context, pool, container, mountpoint str
 		done <- err
 	}()
 	// wait until the kernel shows a mount there
-	deadline := time.Now().Add(30 * time.Second)
+	wait := r.Timeout
+	if wait <= 0 {
+		wait = 30 * time.Second
+	}
+	deadline := time.Now().Add(wait)
 	for {
 		notMnt, err := r.Mounter.IsLikelyNotMountPoint(mountpoint)
 		if err == nil && !notMnt {
@@ -108,15 +118,27 @@ func (r *DfuseRunner) Start(ctx context.Context, pool, container, mountpoint str
 		case err := <-done:
 			return fmt.Errorf("dfuse exited before mounting %s: %v", mountpoint, err)
 		case <-ctx.Done():
-			_ = cmd.Process.Kill()
+			r.kill(mountpoint, cmd)
 			return ctx.Err()
 		case <-time.After(200 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
-			_ = cmd.Process.Kill()
-			return fmt.Errorf("dfuse did not mount %s within 30s", mountpoint)
+			r.kill(mountpoint, cmd)
+			return fmt.Errorf("dfuse did not mount %s within %s", mountpoint, wait)
 		}
 	}
+}
+
+// kill ends a dfuse that never mounted and drops it from procs immediately: the
+// reaper goroutine does that too, but a retry arriving before it runs would find
+// the entry and take the mount for granted.
+func (r *DfuseRunner) kill(mountpoint string, cmd *exec.Cmd) {
+	_ = cmd.Process.Kill()
+	r.mu.Lock()
+	if r.procs[mountpoint] == cmd {
+		delete(r.procs, mountpoint)
+	}
+	r.mu.Unlock()
 }
 
 func (r *DfuseRunner) Stop(_ context.Context, mountpoint string) error {

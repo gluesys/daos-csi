@@ -173,10 +173,11 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		return nil, status.Errorf(codes.InvalidArgument, "volume context needs %s and %s", ctxPool, ctxContainer)
 	}
 	mnt := d.stagePath(id)
-	if !d.cfg.Fuse.Running(mnt) {
-		if err := d.cfg.Fuse.Start(ctx, pool, cont, mnt); err != nil {
-			return nil, status.Errorf(codes.Internal, "dfuse %s/%s at %s: %v", pool, cont, mnt, err)
-		}
+	// Start is idempotent and is the only thing that knows whether the mount is
+	// really there; a Running() check here would publish a directory that dfuse
+	// failed to mount.
+	if err := d.cfg.Fuse.Start(ctx, pool, cont, mnt); err != nil {
+		return nil, status.Errorf(codes.Internal, "dfuse %s/%s at %s: %v", pool, cont, mnt, err)
 	}
 	if err := d.saveState(volumeState{VolumeID: id, Pool: pool, Container: cont, Mount: mnt}); err != nil {
 		return nil, status.Errorf(codes.Internal, "record state: %v", err)
@@ -252,6 +253,14 @@ func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 }
 
 // bind mounts src at dst (idempotent).
+// notMountedErr reports whether umount(8) failed only because nothing was
+// mounted there.
+func notMountedErr(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not mounted") || strings.Contains(msg, "not currently mounted") ||
+		strings.Contains(msg, "no mount point specified")
+}
+
 func (d *Driver) bind(src, dst string, readonly bool) error {
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
@@ -272,17 +281,18 @@ func (d *Driver) bind(src, dst string, readonly bool) error {
 
 // unbind unmounts dst if mounted and removes the directory (idempotent).
 func (d *Driver) unbind(dst string) error {
-	notMnt, err := d.cfg.Mounter.IsLikelyNotMountPoint(dst)
-	if err != nil {
+	if _, err := os.Stat(dst); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	if !notMnt {
-		if err := d.cfg.Mounter.Unmount(dst); err != nil {
-			return err
-		}
+	// IsLikelyNotMountPoint compares st_dev with the parent, so it cannot see a
+	// bind mount that stays on the same filesystem -- which is what dst is when
+	// the staged path is not a dfuse mount. Unmount unconditionally and accept
+	// "not mounted".
+	if err := d.cfg.Mounter.Unmount(dst); err != nil && !notMountedErr(err) {
+		return err
 	}
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 		return err
