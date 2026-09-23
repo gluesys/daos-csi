@@ -20,6 +20,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -281,11 +282,16 @@ func (d *Driver) bind(src, dst string, readonly bool) error {
 
 // unbind unmounts dst if mounted and removes the directory (idempotent).
 func (d *Driver) unbind(dst string) error {
-	if _, err := os.Stat(dst); err != nil {
+	if _, err := d.stat(dst); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		// ENOTCONN is a dfuse that died under the mount (the node plugin was
+		// restarted, say). The mount is still there and is exactly what has to go,
+		// so this is a reason to unmount, not to give up.
+		if !errors.Is(err, syscall.ENOTCONN) {
+			return err
+		}
 	}
 	// IsLikelyNotMountPoint compares st_dev with the parent, so it cannot see a
 	// bind mount that stays on the same filesystem -- which is what dst is when

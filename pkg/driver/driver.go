@@ -74,6 +74,9 @@ type Driver struct {
 
 	cfg Config
 	srv *grpc.Server
+	// stat is os.Stat, replaced in tests to produce the errors a dead FUSE
+	// mount returns.
+	stat func(string) (os.FileInfo, error)
 }
 
 // New validates the config and returns a Driver.
@@ -101,7 +104,7 @@ func New(cfg Config) (*Driver, error) {
 			cfg.StagingDir = "/var/lib/daos-csi"
 		}
 	}
-	return &Driver{cfg: cfg}, nil
+	return &Driver{cfg: cfg, stat: os.Stat}, nil
 }
 
 // Run serves until ctx is cancelled.

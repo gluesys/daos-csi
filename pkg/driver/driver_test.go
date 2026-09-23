@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -340,3 +341,33 @@ func TestUnbindUnmountsABindTheDeviceCheckCannotSee(t *testing.T) {
 type sameDeviceMounts struct{ *fakeMounts }
 
 func (sameDeviceMounts) IsLikelyNotMountPoint(string) (bool, error) { return true, nil }
+
+// A dfuse that died under the staging bind makes every stat there fail with
+// ENOTCONN. unbind used to give up on that error, so NodeUnstageVolume retried
+// forever and kubelet could never re-create the directory (exaci4-2,
+// 2026-09-22, after a node plugin restart).
+func TestUnbindClearsAMountWhoseFuseIsDead(t *testing.T) {
+	mounts := newFakeMounts()
+	d, err := New(Config{Endpoint: "unix://" + filepath.Join(t.TempDir(), "csi.sock"), NodeID: "node-a",
+		Containers: newFakeCRs(), Namespace: "daos-csi", Mounter: mounts,
+		Fuse: newFakeFuse(), StagingDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "globalmount")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := mounts.Mount("src", dst, "", []string{"bind"}); err != nil {
+		t.Fatal(err)
+	}
+	d.stat = func(string) (os.FileInfo, error) {
+		return nil, &os.PathError{Op: "stat", Path: dst, Err: syscall.ENOTCONN}
+	}
+	if err := d.unbind(dst); err != nil {
+		t.Fatalf("unbind on a dead fuse mount: %v", err)
+	}
+	if len(mounts.mounts) != 0 {
+		t.Fatalf("the dead mount must be unmounted: %v", mounts.mounts)
+	}
+}
