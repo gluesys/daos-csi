@@ -21,6 +21,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -58,3 +59,44 @@ type neverMounted struct{}
 func (neverMounted) Mount(_, _, _ string, _ []string) error     { return nil }
 func (neverMounted) Unmount(string) error                       { return nil }
 func (neverMounted) IsLikelyNotMountPoint(string) (bool, error) { return true, nil }
+
+// A dfuse that died leaves a mountpoint where every stat fails with ENOTCONN, so
+// MkdirAll there fails with "file exists". Clearing the stale mount has to come
+// first or the volume can never be staged again (exaci4-2, 2026-09-23).
+func TestDfuseRunnerClearsAStaleMountBeforeCreatingTheDirectory(t *testing.T) {
+	dir := t.TempDir()
+	mnt := filepath.Join(dir, "m")
+	// stands in for the unusable path a dead FUSE mount leaves behind
+	if err := os.Symlink(filepath.Join(dir, "gone"), mnt); err != nil {
+		t.Fatal(err)
+	}
+	umount := filepath.Join(dir, "fake-fusermount3")
+	if err := os.WriteFile(umount, []byte("#!/bin/sh\nrm -f \"$2\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(dir, "fake-dfuse")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec sleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := NewDfuseRunner(deadMount{})
+	r.Bin, r.Umount, r.Timeout = fake, umount, 200*time.Millisecond
+
+	// it still fails (the fake dfuse never mounts), but only after getting past
+	// the stale path
+	if err := r.Start(context.Background(), "p", "c", mnt); err == nil {
+		t.Fatal("Start must fail when dfuse never mounts")
+	}
+	fi, err := os.Stat(mnt)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("the stale mount must be cleared and the directory created: %v", err)
+	}
+}
+
+// deadMount answers like a mountpoint whose FUSE daemon is gone.
+type deadMount struct{}
+
+func (deadMount) Mount(_, _, _ string, _ []string) error { return nil }
+func (deadMount) Unmount(string) error                   { return nil }
+func (deadMount) IsLikelyNotMountPoint(p string) (bool, error) {
+	return false, &os.PathError{Op: "stat", Path: p, Err: syscall.ENOTCONN}
+}

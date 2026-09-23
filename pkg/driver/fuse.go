@@ -78,12 +78,13 @@ func (r *DfuseRunner) Start(ctx context.Context, pool, container, mountpoint str
 			return nil
 		}
 	}
-	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
-		return err
-	}
-	// a stale FUSE mount from a previous plugin instance answers ENOTCONN: unmount it first
+	// A stale FUSE mount from a previous plugin instance answers ENOTCONN, and
+	// MkdirAll on such a path fails with "file exists", so clear it first.
 	if notMnt, err := r.Mounter.IsLikelyNotMountPoint(mountpoint); err != nil || !notMnt {
 		_ = exec.Command(r.Umount, "-uz", mountpoint).Run()
+	}
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return err
 	}
 	args := append([]string{"--pool", pool, "--container", container, "--mountpoint", mountpoint, "--foreground"}, r.Args...)
 	cmd := exec.Command(r.Bin, args...)
