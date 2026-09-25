@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -45,6 +46,11 @@ type volumeState struct {
 	Pool      string `json:"pool"`
 	Container string `json:"container"`
 	Mount     string `json:"mount"`
+	// StagingTarget is kubelet's staging path (the "globalmount"). It is a bind
+	// of Mount, so when the plugin restarts and dfuse dies it turns into a dead
+	// FUSE mount that kubelet itself trips over (MountDevice cannot mkdir it)
+	// before it ever calls NodeStage. Recovery has to repair it.
+	StagingTarget string `json:"stagingTarget,omitempty"`
 }
 
 func (d *Driver) stagePath(id string) string { return filepath.Join(d.cfg.StagingDir, "mounts", id) }
@@ -70,6 +76,14 @@ func (d *Driver) loadState(id string) (*volumeState, error) {
 }
 
 // recoverMounts re-creates dfuse mounts recorded before a restart.
+//
+// A restart kills every dfuse (they are children of the plugin), and each
+// kubelet staging bind of those mounts becomes a dead FUSE mount. kubelet then
+// fails MountDevice on "mkdir globalmount: transport endpoint is not
+// connected" and never reaches NodeStage, so nothing on the CSI side can help
+// (exaci4-2, 2026-09-26). Clearing those dead binds is therefore done first
+// and unconditionally: even when dfuse cannot be brought back here, kubelet
+// can then call NodeStage, which starts it.
 func (d *Driver) recoverMounts(ctx context.Context) error {
 	entries, err := os.ReadDir(filepath.Join(d.cfg.StagingDir, "state"))
 	if err != nil {
@@ -78,6 +92,7 @@ func (d *Driver) recoverMounts(ctx context.Context) error {
 		}
 		return err
 	}
+	var states []*volumeState
 	var errs []string
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".json") {
@@ -88,9 +103,28 @@ func (d *Driver) recoverMounts(ctx context.Context) error {
 			errs = append(errs, e.Name()+": "+err.Error())
 			continue
 		}
+		states = append(states, s)
+		if s.StagingTarget != "" {
+			if err := d.clearDeadMount(s.StagingTarget); err != nil {
+				errs = append(errs, s.VolumeID+": staging bind: "+err.Error())
+			}
+		}
+	}
+	if len(states) > 0 {
+		// the agent is a native sidecar: started before us, not necessarily
+		// listening yet. The dmg/daos Jobs wait for the socket the same way.
+		waitForAgentSocket(ctx, 60*time.Second)
+	}
+	for _, s := range states {
 		if err := d.cfg.Fuse.Start(ctx, s.Pool, s.Container, s.Mount); err != nil {
 			errs = append(errs, s.VolumeID+": "+err.Error())
 			continue
+		}
+		if s.StagingTarget != "" {
+			if err := d.bind(s.Mount, s.StagingTarget, false); err != nil {
+				errs = append(errs, s.VolumeID+": rebind staging: "+err.Error())
+				continue
+			}
 		}
 		klog.InfoS("recovered dfuse mount", "volume", s.VolumeID, "pool", s.Pool, "container", s.Container)
 	}
@@ -180,7 +214,8 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	if err := d.cfg.Fuse.Start(ctx, pool, cont, mnt); err != nil {
 		return nil, status.Errorf(codes.Internal, "dfuse %s/%s at %s: %v", pool, cont, mnt, err)
 	}
-	if err := d.saveState(volumeState{VolumeID: id, Pool: pool, Container: cont, Mount: mnt}); err != nil {
+	if err := d.saveState(volumeState{VolumeID: id, Pool: pool, Container: cont, Mount: mnt,
+		StagingTarget: req.GetStagingTargetPath()}); err != nil {
 		return nil, status.Errorf(codes.Internal, "record state: %v", err)
 	}
 	// expose the mount at kubelet's staging path too, so it is visible in the
@@ -262,7 +297,49 @@ func notMountedErr(err error) bool {
 		strings.Contains(msg, "no mount point specified")
 }
 
+// clearDeadMount unmounts path if it is a FUSE mount whose daemon is gone
+// (every stat answers ENOTCONN). A missing or healthy path is left alone.
+func (d *Driver) clearDeadMount(path string) error {
+	_, err := d.stat(path)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	if !errors.Is(err, syscall.ENOTCONN) {
+		return err
+	}
+	klog.InfoS("clearing dead FUSE mount", "path", path)
+	if err := d.cfg.Mounter.Unmount(path); err != nil && !notMountedErr(err) {
+		return err
+	}
+	return nil
+}
+
+// waitForAgentSocket blocks until the daos_agent socket exists or the wait
+// runs out; without DAOS_AGENT_DRPC_DIR there is nothing to wait for.
+func waitForAgentSocket(ctx context.Context, wait time.Duration) {
+	dir := os.Getenv("DAOS_AGENT_DRPC_DIR")
+	if dir == "" {
+		return
+	}
+	sock := filepath.Join(dir, "daos_agent.sock")
+	deadline := time.Now().Add(wait)
+	for {
+		if _, err := os.Stat(sock); err == nil {
+			return
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			klog.InfoS("daos_agent socket not seen; recovering anyway", "socket", sock, "waited", wait)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 func (d *Driver) bind(src, dst string, readonly bool) error {
+	// a dead FUSE mount at dst makes MkdirAll fail with "file exists": clear it first
+	if err := d.clearDeadMount(dst); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}

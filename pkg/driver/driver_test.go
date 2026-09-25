@@ -171,14 +171,34 @@ func TestNodeStagePublishAndRecovery(t *testing.T) {
 		t.Fatalf("re-stage: %v starts=%d", err, fuse.starts)
 	}
 
-	// plugin restart: a new Driver with the same StagingDir and an empty fuse recovers the mount
+	// the state file must remember kubelet's staging path, or recovery cannot repair it
+	if st, err := d.loadState("pvc-1"); err != nil || st.StagingTarget != staging {
+		t.Fatalf("state must record the staging target: %+v %v", st, err)
+	}
+
+	// plugin restart: dfuse is gone, and kubelet's staging bind of it is now a
+	// dead FUSE mount (every stat says ENOTCONN). A new Driver with the same
+	// StagingDir must clear that bind, bring dfuse back and bind it again --
+	// otherwise kubelet fails MountDevice on the dead directory and never calls
+	// NodeStage (exaci4-2, 2026-09-26).
+	dead := &deadMounts{fakeMounts: mounts, dead: map[string]bool{staging: true}}
 	fuse2 := newFakeFuse()
-	d2, _ := New(Config{Endpoint: "unix:///tmp/x.sock", NodeID: "node-a", Containers: newFakeCRs(), Namespace: "n", Mounter: mounts, Fuse: fuse2, StagingDir: d.cfg.StagingDir})
+	d2, _ := New(Config{Endpoint: "unix:///tmp/x.sock", NodeID: "node-a", Containers: newFakeCRs(), Namespace: "n", Mounter: dead, Fuse: fuse2, StagingDir: d.cfg.StagingDir})
+	d2.stat = dead.stat
 	if err := d2.recoverMounts(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if !fuse2.Running(mnt) {
 		t.Fatal("state file must bring dfuse back after a restart")
+	}
+	if dead.dead[staging] {
+		t.Fatal("recovery must clear the dead staging bind")
+	}
+	if mounts.mounts[staging] != mnt {
+		t.Fatalf("recovery must bind the staging path to the new dfuse mount again: %v", mounts.mounts)
+	}
+	if !dead.unmounted[staging] {
+		t.Fatal("the dead bind must be unmounted, not just forgotten")
 	}
 
 	if _, err := d.NodeUnpublishVolume(ctx, &csi.NodeUnpublishVolumeRequest{VolumeId: "pvc-1", TargetPath: target}); err != nil {
@@ -369,5 +389,64 @@ func TestUnbindClearsAMountWhoseFuseIsDead(t *testing.T) {
 	}
 	if len(mounts.mounts) != 0 {
 		t.Fatalf("the dead mount must be unmounted: %v", mounts.mounts)
+	}
+}
+
+// deadMounts is a fakeMounts whose listed paths behave like a FUSE mount whose
+// daemon died: stat and IsLikelyNotMountPoint answer ENOTCONN until Unmount.
+type deadMounts struct {
+	*fakeMounts
+	dead      map[string]bool
+	unmounted map[string]bool
+}
+
+func (m *deadMounts) IsLikelyNotMountPoint(p string) (bool, error) {
+	if m.dead[p] {
+		return false, &os.PathError{Op: "stat", Path: p, Err: syscall.ENOTCONN}
+	}
+	return m.fakeMounts.IsLikelyNotMountPoint(p)
+}
+
+func (m *deadMounts) Unmount(p string) error {
+	if m.dead[p] {
+		delete(m.dead, p)
+		if m.unmounted == nil {
+			m.unmounted = map[string]bool{}
+		}
+		m.unmounted[p] = true
+		delete(m.fakeMounts.mounts, p)
+		return nil
+	}
+	return m.fakeMounts.Unmount(p)
+}
+
+func (m *deadMounts) stat(p string) (os.FileInfo, error) {
+	if m.dead[p] {
+		return nil, &os.PathError{Op: "stat", Path: p, Err: syscall.ENOTCONN}
+	}
+	return os.Stat(p)
+}
+
+// bind must be able to replace a dead FUSE mount at its destination, since
+// that is exactly what kubelet's staging path is after a plugin restart.
+func TestBindReplacesADeadMountAtTheDestination(t *testing.T) {
+	base := newFakeMounts()
+	dst := filepath.Join(t.TempDir(), "globalmount")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base.mounts[dst] = "old-dfuse"
+	dead := &deadMounts{fakeMounts: base, dead: map[string]bool{dst: true}}
+	d, err := New(Config{Endpoint: "unix://" + filepath.Join(t.TempDir(), "csi.sock"), NodeID: "node-a",
+		Containers: newFakeCRs(), Namespace: "daos-csi", Mounter: dead, Fuse: newFakeFuse(), StagingDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.stat = dead.stat
+	if err := d.bind("new-dfuse", dst, false); err != nil {
+		t.Fatalf("bind over a dead mount: %v", err)
+	}
+	if base.mounts[dst] != "new-dfuse" {
+		t.Fatalf("destination must now be bound to the new mount: %v", base.mounts)
 	}
 }

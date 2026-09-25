@@ -192,3 +192,19 @@ func NewSystemMounter() *SystemMounter { return &SystemMounter{Interface: mount.
 func (m *SystemMounter) Mount(source, target, fstype string, options []string) error {
 	return m.Interface.Mount(source, target, fstype, options)
 }
+
+// Unmount tries a normal unmount and falls back to a lazy one: a dead FUSE
+// mount (daemon gone) can refuse a plain umount while something still holds
+// it, and lazy detach is what an operator would do by hand.
+func (m *SystemMounter) Unmount(target string) error {
+	err := m.Interface.Unmount(target)
+	if err == nil {
+		return nil
+	}
+	if out, lerr := exec.Command("umount", "-l", target).CombinedOutput(); lerr == nil {
+		klog.InfoS("lazy unmount", "target", target)
+		return nil
+	} else {
+		return fmt.Errorf("%v; umount -l: %v: %s", err, lerr, strings.TrimSpace(string(out)))
+	}
+}
