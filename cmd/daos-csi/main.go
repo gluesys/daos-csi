@@ -46,10 +46,11 @@ func main() {
 		namespace  = flag.String("namespace", os.Getenv("DAOS_CSI_NAMESPACE"), "namespace for DaosContainer CRs (controller mode)")
 		kubeconfig = flag.String("kubeconfig", os.Getenv("KUBECONFIG"), "kubeconfig (empty = in-cluster)")
 		stagingDir = flag.String("staging-dir", "/var/lib/daos-csi", "host dir for dfuse mounts and state (node mode)")
+		kubeletDir = flag.String("kubelet-dir", "/var/lib/kubelet", "kubelet root as mounted in this container; recovery sweeps its CSI staging binds (node mode)")
 		dfuseArgs  = flag.String("dfuse-args", "", "extra dfuse flags, comma separated (e.g. --disable-caching)")
 	)
 	flag.Parse()
-	cfg := driver.Config{Name: *name, NodeID: *nodeID, Mode: driver.Mode(*mode), Endpoint: *endpoint, Namespace: *namespace, StagingDir: *stagingDir}
+	cfg := driver.Config{Name: *name, NodeID: *nodeID, Mode: driver.Mode(*mode), Endpoint: *endpoint, Namespace: *namespace, StagingDir: *stagingDir, KubeletDir: *kubeletDir}
 	if cfg.Mode != driver.ModeNode {
 		rc, err := restConfig(*kubeconfig)
 		if err != nil {

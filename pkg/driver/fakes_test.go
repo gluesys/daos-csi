@@ -122,6 +122,8 @@ type fakeFuse struct {
 	running map[string][2]string // mountpoint -> pool, container
 	starts  int
 	fail    bool
+	// failTimes makes the next N Start calls fail (an agent that is not answering yet)
+	failTimes int
 }
 
 func newFakeFuse() *fakeFuse { return &fakeFuse{running: map[string][2]string{}} }
@@ -131,6 +133,10 @@ func (f *fakeFuse) Start(_ context.Context, pool, container, mountpoint string) 
 	defer f.mu.Unlock()
 	if f.fail {
 		return fmt.Errorf("dfuse: DER_NONEXIST")
+	}
+	if f.failTimes > 0 {
+		f.failTimes--
+		return fmt.Errorf("dfuse did not mount %s within 30s", mountpoint)
 	}
 	if _, ok := f.running[mountpoint]; ok {
 		return nil // Start is idempotent: a live mount is left alone

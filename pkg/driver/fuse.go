@@ -60,6 +60,23 @@ type DfuseRunner struct {
 
 	mu    sync.Mutex
 	procs map[string]*exec.Cmd
+	// one Start/Stop at a time per mountpoint: startup recovery and a
+	// NodeStage for the same volume must not both spawn a dfuse
+	locks map[string]*sync.Mutex
+}
+
+func (r *DfuseRunner) lockFor(mountpoint string) *sync.Mutex {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.locks == nil {
+		r.locks = map[string]*sync.Mutex{}
+	}
+	l, ok := r.locks[mountpoint]
+	if !ok {
+		l = &sync.Mutex{}
+		r.locks[mountpoint] = l
+	}
+	return l
 }
 
 func NewDfuseRunner(m Mounter, extra ...string) *DfuseRunner {
@@ -67,6 +84,9 @@ func NewDfuseRunner(m Mounter, extra ...string) *DfuseRunner {
 }
 
 func (r *DfuseRunner) Start(ctx context.Context, pool, container, mountpoint string) error {
+	l := r.lockFor(mountpoint)
+	l.Lock()
+	defer l.Unlock()
 	// A tracked process is not proof of a mount: a previous Start may have timed
 	// out and killed dfuse, and its entry lives until the reaper goroutine runs.
 	// Only a process *and* a live mount means there is nothing to do.
@@ -143,6 +163,9 @@ func (r *DfuseRunner) kill(mountpoint string, cmd *exec.Cmd) {
 }
 
 func (r *DfuseRunner) Stop(_ context.Context, mountpoint string) error {
+	l := r.lockFor(mountpoint)
+	l.Lock()
+	defer l.Unlock()
 	// the path can be gone already (a previous unstage, or somebody cleaned up by
 	// hand); then there is nothing to unmount and reporting failure would make
 	// kubelet retry forever

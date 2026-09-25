@@ -19,8 +19,11 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -99,4 +102,37 @@ func (deadMount) Mount(_, _, _ string, _ []string) error { return nil }
 func (deadMount) Unmount(string) error                   { return nil }
 func (deadMount) IsLikelyNotMountPoint(p string) (bool, error) {
 	return false, &os.PathError{Op: "stat", Path: p, Err: syscall.ENOTCONN}
+}
+
+// Startup recovery and a NodeStage for the same volume can race; only one
+// dfuse may be spawned at a time for a mountpoint.
+func TestDfuseRunnerSerializesStartsPerMountpoint(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "starts.log")
+	fake := filepath.Join(dir, "fake-dfuse")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\ndate +%s%N >> "+log+"\nexec sleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := NewDfuseRunner(neverMounted{})
+	r.Bin, r.Timeout = fake, 200*time.Millisecond
+	mnt := filepath.Join(dir, "m")
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = r.Start(context.Background(), "p", "c", mnt) }()
+	}
+	wg.Wait()
+	b, _ := os.ReadFile(log)
+	lines := strings.Fields(string(b))
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 sequential spawns, got %d", len(lines))
+	}
+	for i := 1; i < len(lines); i++ {
+		var a, c int64
+		fmt.Sscan(lines[i-1], &a)
+		fmt.Sscan(lines[i], &c)
+		if c-a < int64(150*time.Millisecond) {
+			t.Fatalf("spawns %d and %d overlapped (%d ms apart)", i-1, i, (c-a)/1e6)
+		}
+	}
 }

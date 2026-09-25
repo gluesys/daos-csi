@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
@@ -64,6 +65,10 @@ type Config struct {
 	Mounter    Mounter
 	Fuse       FuseRunner
 	StagingDir string // host dir where per-volume dfuse mounts and state live
+	// KubeletDir is kubelet's root as seen from this process (the node plugin
+	// mounts it at the same path). Recovery sweeps this driver's staging binds
+	// under it for dead FUSE mounts.
+	KubeletDir string
 }
 
 // Driver is the gRPC server for the three CSI services.
@@ -77,6 +82,13 @@ type Driver struct {
 	// stat is os.Stat, replaced in tests to produce the errors a dead FUSE
 	// mount returns.
 	stat func(string) (os.FileInfo, error)
+	// mountinfo is /proc/self/mountinfo, replaced in tests.
+	mountinfo string
+	// recovery retries: a dfuse that fails to come back at startup (the agent
+	// sidecar is started before us but not necessarily answering yet) is
+	// retried in the background this many times, this far apart.
+	recoveryRetries  int
+	recoveryInterval time.Duration
 }
 
 // New validates the config and returns a Driver.
@@ -104,7 +116,11 @@ func New(cfg Config) (*Driver, error) {
 			cfg.StagingDir = "/var/lib/daos-csi"
 		}
 	}
-	return &Driver{cfg: cfg, stat: os.Stat}, nil
+	if cfg.KubeletDir == "" {
+		cfg.KubeletDir = "/var/lib/kubelet"
+	}
+	return &Driver{cfg: cfg, stat: os.Stat, mountinfo: "/proc/self/mountinfo",
+		recoveryRetries: 10, recoveryInterval: 30 * time.Second}, nil
 }
 
 // Run serves until ctx is cancelled.

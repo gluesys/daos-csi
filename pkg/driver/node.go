@@ -18,10 +18,12 @@ limitations under the License.
 package driver
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,12 +88,11 @@ func (d *Driver) loadState(id string) (*volumeState, error) {
 // can then call NodeStage, which starts it.
 func (d *Driver) recoverMounts(ctx context.Context) error {
 	entries, err := os.ReadDir(filepath.Join(d.cfg.StagingDir, "state"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	// no state directory means nothing was ever staged by this plugin -- but a
+	// previous version may still have left binds behind, so the sweep runs anyway
 	var states []*volumeState
 	var errs []string
 	for _, e := range entries {
@@ -110,23 +111,27 @@ func (d *Driver) recoverMounts(ctx context.Context) error {
 			}
 		}
 	}
+	// State files written before StagingTarget existed do not say where the
+	// bind is; kubelet's layout does. Sweep this driver's directory as well.
+	if err := d.sweepDeadGlobalMounts(); err != nil {
+		errs = append(errs, "sweep: "+err.Error())
+	}
 	if len(states) > 0 {
 		// the agent is a native sidecar: started before us, not necessarily
 		// listening yet. The dmg/daos Jobs wait for the socket the same way.
 		waitForAgentSocket(ctx, 60*time.Second)
 	}
+	var pending []*volumeState
 	for _, s := range states {
-		if err := d.cfg.Fuse.Start(ctx, s.Pool, s.Container, s.Mount); err != nil {
+		if err := d.recoverOne(ctx, s); err != nil {
 			errs = append(errs, s.VolumeID+": "+err.Error())
-			continue
+			pending = append(pending, s)
 		}
-		if s.StagingTarget != "" {
-			if err := d.bind(s.Mount, s.StagingTarget, false); err != nil {
-				errs = append(errs, s.VolumeID+": rebind staging: "+err.Error())
-				continue
-			}
-		}
-		klog.InfoS("recovered dfuse mount", "volume", s.VolumeID, "pool", s.Pool, "container", s.Container)
+	}
+	if len(pending) > 0 {
+		// Not fatal: the dead binds are cleared, so kubelet can call NodeStage
+		// and start dfuse itself. Meanwhile keep trying, in case nothing asks.
+		go d.retryRecovery(ctx, pending)
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
@@ -295,6 +300,92 @@ func notMountedErr(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not mounted") || strings.Contains(msg, "not currently mounted") ||
 		strings.Contains(msg, "no mount point specified")
+}
+
+// recoverOne brings one recorded mount back and rebinds kubelet's staging path to it.
+func (d *Driver) recoverOne(ctx context.Context, s *volumeState) error {
+	if err := d.cfg.Fuse.Start(ctx, s.Pool, s.Container, s.Mount); err != nil {
+		return err
+	}
+	if s.StagingTarget != "" {
+		if err := d.bind(s.Mount, s.StagingTarget, false); err != nil {
+			return fmt.Errorf("rebind staging: %w", err)
+		}
+	}
+	klog.InfoS("recovered dfuse mount", "volume", s.VolumeID, "pool", s.Pool, "container", s.Container)
+	return nil
+}
+
+// retryRecovery keeps trying the mounts that did not come back at startup.
+func (d *Driver) retryRecovery(ctx context.Context, pending []*volumeState) {
+	for attempt := 1; attempt <= d.recoveryRetries && len(pending) > 0; attempt++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(d.recoveryInterval):
+		}
+		var still []*volumeState
+		for _, s := range pending {
+			if err := d.recoverOne(ctx, s); err != nil {
+				klog.InfoS("mount recovery retry failed", "volume", s.VolumeID, "attempt", attempt, "err", err)
+				still = append(still, s)
+			}
+		}
+		pending = still
+	}
+	for _, s := range pending {
+		klog.ErrorS(nil, "mount recovery gave up; NodeStage will start dfuse when a pod asks", "volume", s.VolumeID)
+	}
+}
+
+// sweepDeadGlobalMounts finds this driver's staging binds in kubelet's plugin
+// directory (<kubeletDir>/plugins/kubernetes.io/csi/<driver>/<hash>/globalmount)
+// and clears the ones whose dfuse is gone.
+func (d *Driver) sweepDeadGlobalMounts() error {
+	prefix := filepath.Join(d.cfg.KubeletDir, "plugins", "kubernetes.io", "csi", d.cfg.Name) + string(filepath.Separator)
+	f, err := os.Open(d.mountinfo)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	var errs []string
+	for _, mp := range fuseMountsUnder(f, prefix) {
+		if err := d.clearDeadMount(mp); err != nil {
+			errs = append(errs, mp+": "+err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// fuseMountsUnder returns the mount points of fuse.daos mounts below prefix,
+// read from a mountinfo(5) stream: "id parent maj:min root mountpoint opts ... - fstype source ...".
+func fuseMountsUnder(r io.Reader, prefix string) []string {
+	var out []string
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		sep := -1
+		for i, f := range fields {
+			if f == "-" {
+				sep = i
+				break
+			}
+		}
+		if sep < 5 || sep+1 >= len(fields) {
+			continue
+		}
+		mp := strings.ReplaceAll(fields[4], `\040`, " ")
+		if strings.HasPrefix(fields[sep+1], "fuse") && strings.HasPrefix(mp, prefix) {
+			out = append(out, mp)
+		}
+	}
+	return out
 }
 
 // clearDeadMount unmounts path if it is a FUSE mount whose daemon is gone

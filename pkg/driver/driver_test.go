@@ -19,11 +19,13 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
@@ -448,5 +450,102 @@ func TestBindReplacesADeadMountAtTheDestination(t *testing.T) {
 	}
 	if base.mounts[dst] != "new-dfuse" {
 		t.Fatalf("destination must now be bound to the new mount: %v", base.mounts)
+	}
+}
+
+// mountinfo parsing: only fuse mounts below the given prefix, path escapes decoded.
+func TestFuseMountsUnder(t *testing.T) {
+	mi := `1609 96 0:112 / /var/lib/kubelet/plugins/kubernetes.io/csi/pod.daos.csi.gluesys.com/b01d/globalmount rw,nosuid - fuse.daos dfuse rw
+1610 96 0:113 / /var/lib/kubelet/plugins/kubernetes.io/csi/other.csi.io/aaaa/globalmount rw - fuse.daos dfuse rw
+1611 96 253:0 /x /var/lib/kubelet/plugins/kubernetes.io/csi/pod.daos.csi.gluesys.com/cccc/globalmount rw - xfs /dev/mapper/rl-root rw
+1612 96 0:114 / /var/lib/kubelet/plugins/kubernetes.io/csi/pod.daos.csi.gluesys.com/with\040space/globalmount rw - fuse.daos dfuse rw
+garbage line
+`
+	got := fuseMountsUnder(strings.NewReader(mi), "/var/lib/kubelet/plugins/kubernetes.io/csi/pod.daos.csi.gluesys.com/")
+	want := []string{
+		"/var/lib/kubelet/plugins/kubernetes.io/csi/pod.daos.csi.gluesys.com/b01d/globalmount",
+		"/var/lib/kubelet/plugins/kubernetes.io/csi/pod.daos.csi.gluesys.com/with space/globalmount",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+// A state file from before StagingTarget existed cannot say where kubelet's
+// bind is, so recovery must find dead binds from kubelet's own layout.
+func TestRecoverySweepsDeadGlobalMountsWithoutStateHelp(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	kubelet := filepath.Join(dir, "kubelet")
+	deadGM := filepath.Join(kubelet, "plugins/kubernetes.io/csi/test.csi/hash1/globalmount")
+	liveGM := filepath.Join(kubelet, "plugins/kubernetes.io/csi/test.csi/hash2/globalmount")
+	foreign := filepath.Join(kubelet, "plugins/kubernetes.io/csi/other.csi/hash3/globalmount")
+	mi := filepath.Join(dir, "mountinfo")
+	body := ""
+	for i, mp := range []string{deadGM, liveGM, foreign} {
+		body += fmt.Sprintf("%d 96 0:%d / %s rw - fuse.daos dfuse rw\n", 1600+i, 200+i, mp)
+	}
+	if err := os.WriteFile(mi, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := newFakeMounts()
+	for _, mp := range []string{deadGM, liveGM, foreign} {
+		base.mounts[mp] = "dfuse"
+	}
+	dead := &deadMounts{fakeMounts: base, dead: map[string]bool{deadGM: true, foreign: true}}
+	d, err := New(Config{Name: "test.csi", Endpoint: "unix:///tmp/x.sock", NodeID: "n", Containers: newFakeCRs(), Namespace: "ns",
+		Mounter: dead, Fuse: newFakeFuse(), StagingDir: filepath.Join(dir, "staging"), KubeletDir: kubelet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.stat, d.mountinfo = dead.stat, mi
+	if err := d.recoverMounts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !dead.unmounted[deadGM] {
+		t.Fatal("the dead bind under this driver's directory must be cleared")
+	}
+	if _, ok := base.mounts[liveGM]; !ok {
+		t.Fatal("a healthy bind must be left alone")
+	}
+	if dead.unmounted[foreign] {
+		t.Fatal("another driver's bind is not ours to touch")
+	}
+}
+
+// dfuse that does not come back at startup (agent not answering yet) is retried
+// in the background until it does, and the staging path is rebound then.
+func TestRecoveryRetriesUntilDfuseComesBack(t *testing.T) {
+	ctx := context.Background()
+	fuse, mounts := newFakeFuse(), newFakeMounts()
+	d := newTestDriver(t, newFakeCRs(), fuse, mounts)
+	staging := filepath.Join(t.TempDir(), "staging")
+	vc := map[string]string{ctxPool: "kv", ctxContainer: "pvc-9", ctxPoolUUID: "pu", ctxContUUID: "cu"}
+	if _, err := d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{VolumeId: "pvc-9", StagingTargetPath: staging, VolumeCapability: rwx(), VolumeContext: vc}); err != nil {
+		t.Fatal(err)
+	}
+	mnt := d.stagePath("pvc-9")
+	delete(mounts.mounts, staging) // the restart took the bind with it
+
+	fuse2 := newFakeFuse()
+	fuse2.failTimes = 2
+	d2, _ := New(Config{Endpoint: "unix:///tmp/x.sock", NodeID: "n", Containers: newFakeCRs(), Namespace: "ns", Mounter: mounts, Fuse: fuse2, StagingDir: d.cfg.StagingDir})
+	d2.recoveryRetries, d2.recoveryInterval = 5, 20*time.Millisecond
+	if err := d2.recoverMounts(ctx); err == nil {
+		t.Fatal("the first attempt is expected to fail here")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !fuse2.Running(mnt) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !fuse2.Running(mnt) {
+		t.Fatal("background retries must bring dfuse back")
+	}
+	deadline = time.Now().Add(time.Second)
+	for mounts.mounts[staging] != mnt && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if mounts.mounts[staging] != mnt {
+		t.Fatalf("staging path must be rebound after the retry succeeds: %v", mounts.mounts)
 	}
 }
