@@ -159,8 +159,11 @@ func TestNodeStagePublishAndRecovery(t *testing.T) {
 	if got := fuse.running[mnt]; got != [2]string{"pu", "cu"} {
 		t.Fatalf("dfuse must use UUIDs when present: %v", got)
 	}
-	if mounts.mounts[staging] != mnt {
-		t.Fatalf("staging path must be a bind of the dfuse mount: %v", mounts.mounts)
+	// kubelet refuses UnmountDevice while the staging path has a mount reference outside its
+	// plugin directory (HasMountRefs), and a bind of our dfuse mount is exactly that: it then
+	// never calls NodeUnstage and dfuse and the container leak (CI cluster, 2026-10-03).
+	if _, ok := mounts.mounts[staging]; ok {
+		t.Fatalf("staging path must not be mounted (kubelet would never unstage): %v", mounts.mounts)
 	}
 	if _, err := d.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{VolumeId: "pvc-1", StagingTargetPath: staging, TargetPath: target, VolumeCapability: rwx(), Readonly: true}); err != nil {
 		t.Fatal(err)
@@ -178,11 +181,13 @@ func TestNodeStagePublishAndRecovery(t *testing.T) {
 		t.Fatalf("state must record the staging target: %+v %v", st, err)
 	}
 
-	// plugin restart: dfuse is gone, and kubelet's staging bind of it is now a
+	// plugin restart after an upgrade from a version that bound the staging path: dfuse is
+	// gone, and that old staging bind is now a
 	// dead FUSE mount (every stat says ENOTCONN). A new Driver with the same
 	// StagingDir must clear that bind, bring dfuse back and bind it again --
 	// otherwise kubelet fails MountDevice on the dead directory and never calls
 	// NodeStage (exaci4-2, 2026-09-26).
+	mounts.mounts[staging] = mnt // what the previous version left
 	dead := &deadMounts{fakeMounts: mounts, dead: map[string]bool{staging: true}}
 	fuse2 := newFakeFuse()
 	d2, _ := New(Config{Endpoint: "unix:///tmp/x.sock", NodeID: "node-a", Containers: newFakeCRs(), Namespace: "n", Mounter: dead, Fuse: fuse2, StagingDir: d.cfg.StagingDir})
@@ -194,10 +199,10 @@ func TestNodeStagePublishAndRecovery(t *testing.T) {
 		t.Fatal("state file must bring dfuse back after a restart")
 	}
 	if dead.dead[staging] {
-		t.Fatal("recovery must clear the dead staging bind")
+		t.Fatal("recovery must clear the dead staging bind an older version left behind")
 	}
-	if mounts.mounts[staging] != mnt {
-		t.Fatalf("recovery must bind the staging path to the new dfuse mount again: %v", mounts.mounts)
+	if _, ok := mounts.mounts[staging]; ok {
+		t.Fatalf("recovery must not bind the staging path again: %v", mounts.mounts)
 	}
 	if !dead.unmounted[staging] {
 		t.Fatal("the dead bind must be unmounted, not just forgotten")
@@ -514,7 +519,7 @@ func TestRecoverySweepsDeadGlobalMountsWithoutStateHelp(t *testing.T) {
 }
 
 // dfuse that does not come back at startup (agent not answering yet) is retried
-// in the background until it does, and the staging path is rebound then.
+// in the background until it does. The staging path is never bound (NodeStageVolume).
 func TestRecoveryRetriesUntilDfuseComesBack(t *testing.T) {
 	ctx := context.Background()
 	fuse, mounts := newFakeFuse(), newFakeMounts()
@@ -525,7 +530,6 @@ func TestRecoveryRetriesUntilDfuseComesBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	mnt := d.stagePath("pvc-9")
-	delete(mounts.mounts, staging) // the restart took the bind with it
 
 	fuse2 := newFakeFuse()
 	fuse2.failTimes = 2
@@ -541,11 +545,7 @@ func TestRecoveryRetriesUntilDfuseComesBack(t *testing.T) {
 	if !fuse2.Running(mnt) {
 		t.Fatal("background retries must bring dfuse back")
 	}
-	deadline = time.Now().Add(time.Second)
-	for mounts.mounts[staging] != mnt && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if mounts.mounts[staging] != mnt {
-		t.Fatalf("staging path must be rebound after the retry succeeds: %v", mounts.mounts)
+	if _, ok := mounts.mounts[staging]; ok {
+		t.Fatalf("recovery must not bind the staging path: %v", mounts.mounts)
 	}
 }
