@@ -38,8 +38,9 @@ import (
 
 // Node plugin (ADR-csi-001): NodeStageVolume runs one dfuse per volume on a
 // staging path under StagingDir (not kubelet's staging path, so it survives
-// kubelet's cleanup and can be recovered), NodePublishVolume bind-mounts the
-// staging path into the pod's target path. Volume state is written to
+// kubelet's cleanup and can be recovered), NodePublishVolume bind-mounts it
+// into the pod's target path. kubelet's own staging path is left a plain directory:
+// binding there stops kubelet from ever calling NodeUnstage. Volume state is written to
 // StagingDir/state/<volume>.json so a restarted plugin re-creates the dfuse
 // mounts (FUSE mounts die with their daemon).
 
@@ -48,10 +49,9 @@ type volumeState struct {
 	Pool      string `json:"pool"`
 	Container string `json:"container"`
 	Mount     string `json:"mount"`
-	// StagingTarget is kubelet's staging path (the "globalmount"). It is a bind
-	// of Mount, so when the plugin restarts and dfuse dies it turns into a dead
-	// FUSE mount that kubelet itself trips over (MountDevice cannot mkdir it)
-	// before it ever calls NodeStage. Recovery has to repair it.
+	// StagingTarget is kubelet's staging path (the "globalmount"). Versions before
+	// 2026-10-03 bound Mount there; after a restart such a bind is a dead FUSE mount
+	// that kubelet trips over (MountDevice cannot mkdir it), so recovery still clears it.
 	StagingTarget string `json:"stagingTarget,omitempty"`
 }
 
@@ -223,11 +223,11 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		StagingTarget: req.GetStagingTargetPath()}); err != nil {
 		return nil, status.Errorf(codes.Internal, "record state: %v", err)
 	}
-	// expose the mount at kubelet's staging path too, so it is visible in the
-	// usual place; publish binds from our path
-	if err := d.bind(mnt, req.GetStagingTargetPath(), false); err != nil {
-		return nil, status.Errorf(codes.Internal, "bind %s -> %s: %v", mnt, req.GetStagingTargetPath(), err)
-	}
+	// Do not bind the mount into kubelet's staging path. kubelet's UnmountDevice refuses to
+	// proceed while that path has a mount reference outside its plugin directory
+	// (HasMountRefs), so a bind of our dfuse mount meant NodeUnstage was never called and
+	// every deleted PVC leaked dfuse and kept the container open (CI cluster, 2026-10-03).
+	// Publish binds from our path; the staging path stays a plain directory.
 	klog.InfoS("staged", "volume", id, "pool", pool, "container", cont, "mount", mnt)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
@@ -237,6 +237,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 	if id == "" || req.GetStagingTargetPath() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume id and staging target path are required")
 	}
+	// Only versions before the fix bound the staging path; unbind tolerates "not mounted".
 	if err := d.unbind(req.GetStagingTargetPath()); err != nil {
 		return nil, status.Errorf(codes.Internal, "unmount %s: %v", req.GetStagingTargetPath(), err)
 	}
@@ -302,15 +303,11 @@ func notMountedErr(err error) bool {
 		strings.Contains(msg, "no mount point specified")
 }
 
-// recoverOne brings one recorded mount back and rebinds kubelet's staging path to it.
+// recoverOne brings one recorded mount back. The staging path is not rebound (see
+// NodeStageVolume); dead binds an older version left there are cleared before this runs.
 func (d *Driver) recoverOne(ctx context.Context, s *volumeState) error {
 	if err := d.cfg.Fuse.Start(ctx, s.Pool, s.Container, s.Mount); err != nil {
 		return err
-	}
-	if s.StagingTarget != "" {
-		if err := d.bind(s.Mount, s.StagingTarget, false); err != nil {
-			return fmt.Errorf("rebind staging: %w", err)
-		}
 	}
 	klog.InfoS("recovered dfuse mount", "volume", s.VolumeID, "pool", s.Pool, "container", s.Container)
 	return nil
